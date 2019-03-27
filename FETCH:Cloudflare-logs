@@ -102,7 +102,8 @@ FETCH(){
   done
 }
 
-# Loop through a sane number of times that won't overlap cron intervals, incrementing the LastRunTimeStamp file by 5 mins each time
+# Loop through a sane number of times that won't overlap cron intervals, incrementing the LastRunTimeStamp file by 5 mins
+# each time. This allows us to "catch up", such as if the machine this runs on is down or Cloudflare's API is unreachable
 while [ "$RUNCOUNT" -lt 2 ] ;
 do
   RUNCOUNT=$(echo "$RUNCOUNT" + 1 | bc)
