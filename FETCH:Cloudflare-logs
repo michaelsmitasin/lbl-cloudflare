@@ -1,0 +1,122 @@
+#! /bin/sh
+###############################################################################
+# Fetch logs of websites behind Cloudflare via their API
+#
+# MNSmitasin@lbl.gov 2018-11-21
+#
+###############################################################################
+### LOCAL VARIABLES
+
+NOTIFYEMAIL="admin@example.com"
+
+# Paths
+FEEDDIR="/home/feeds/CLOUDFLARE-logs"
+LIBDIR="/home/feeds/lib"
+
+# Initial Values at runtime
+TIMESTAMPFILE="$LIBDIR/Cloudflare-logs-LastRunTimeStamp"
+CURRENTTIME=$(date -j "+%s")
+RUNCOUNT="0"
+
+# Cloudflare variables
+CFAPIVERSION="v4"
+
+# Authentication
+USERNAME="feeds@example.com"
+AUTHKEY=$(cat $LIBDIR/CLOUDFLARE-api-key | grep -v "\#")
+
+# Other variablse
+#FIELDLIST="ClientIP,RayID,EdgeStartTimestamp"
+FIELDLIST="\
+EdgeStartTimestamp,\
+ClientIP,\
+ClientSrcPort,\
+ClientSSLCipher,\
+ClientSSLProtocol,\
+ClientRequestMethod,\
+ClientRequestProtocol,\
+ClientRequestHost,\
+ClientRequestURI,\
+ClientRequestBytes,\
+ClientRequestUserAgent,\
+ClientRequestReferer,\
+OriginIP,\
+OriginResponseStatus,\
+OriginResponseBytes,\
+CacheCacheStatus,\
+EdgeServerIP,\
+WAFAction,\
+WAFFlags,\
+WAFMatchedVar,\
+WAFProfile,\
+WAFRuleID,\
+WAFRuleMessage"
+
+###############################################################################
+### FUNCTIONS
+
+# Check that TIMESTAMPFILE is non-null, error and exit if null
+if [ -z $(cat "$TIMESTAMPFILE") ]
+then
+  echo "$0 will not continue until TIMESTAMPFILE returns non-null value" | /usr/bin/mail -s "FETCH:Cloudflare - TIMESTAMPFILE is null" "$NOTIFYEMAIL"
+  exit 1
+else
+  : # no-op
+fi
+
+CHECKCURRENTTIME(){
+  TIMEDIFF=$(echo "$CURRENTTIME - $(cat $TIMESTAMPFILE)" | bc)
+  # Cloudflare will only returns logs older than 5 mins
+  # Check if the last timestamp is less than 10 mins old, so that we don't try to fetch a 5 min interval that would go less than 5 mins old
+  if [ "$TIMEDIFF" -lt 600 ]
+  then
+    exit 0
+  else
+#    echo "Time Difference: $TIMEDIFF"
+    : # no-op
+  fi
+}
+
+# List Zones
+ZONEIDS=$(/usr/local/bin/curl -s -X GET "https://api.cloudflare.com/client/$CFAPIVERSION/zones?status=active" \
+     -H "X-Auth-Email: $USERNAME" \
+     -H "X-Auth-Key: $AUTHKEY" \
+     -H "Accept: application/json" | /usr/local/bin/jq -r .result[].id)
+
+FETCH(){
+  CHECKCURRENTTIME
+  # Output filename, should be logs in Pacific Time up to day change
+  THISMONTH="$(date -j -r "$LASTTIMESTAMP" "+%Y-%m")"
+  OUTFILE="$(date -j -r "$LASTTIMESTAMP" "+%Y-%m-%d")"
+  OUTPATH="$FEEDDIR/$THISMONTH"
+  mkdir -p "$OUTPATH"
+  # Loop through zones to fetch logs
+  for ZONEID in $ZONEIDS;
+  do
+    # sleep to avoid "429 Too Many Requests"
+    sleep 5
+    /usr/local/bin/curl -s -X GET "https://api.cloudflare.com/client/$CFAPIVERSION/zones/$ZONEID/logs/received?start=$STARTTIME&end=$ENDTIME&fields=$FIELDLIST&timestamps=unixnano" \
+       -H "X-Auth-Email: $USERNAME" \
+       -H "X-Auth-Key: $AUTHKEY" \
+       -H "Accept: application/json" >> "$OUTPATH"/"$OUTFILE"
+  done
+}
+
+# Loop through a sane number of times that won't overlap cron intervals, incrementing the LastRunTimeStamp file by 5 mins each time
+while [ "$RUNCOUNT" -lt 2 ] ;
+do
+  RUNCOUNT=$(echo "$RUNCOUNT" + 1 | bc)
+  # Set all the working timestamps based on last time stamp
+  LASTTIMESTAMP=$(cat "$TIMESTAMPFILE")
+  STARTTIME=$(date -j -r "$LASTTIMESTAMP" -u "+%Y-%m-%dT%H:%M:%SZ")
+  ENDINUNIX=$(date -j -r $(echo "$LASTTIMESTAMP" +300 | bc) "+%s")
+  ENDTIME=$(date -j -r $ENDINUNIX -u "+%Y-%m-%dT%H:%M:%SZ")
+  FETCH
+  # Write the last time stamp out to the tracker file to be used as start time stamp next loop
+  echo "$ENDINUNIX" > "$TIMESTAMPFILE"
+  sleep 1
+done
+
+###############################################################################
+### CLEANUP
+exit
