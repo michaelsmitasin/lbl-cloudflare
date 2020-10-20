@@ -2,7 +2,7 @@
 ###############################################################################
 # Fetch logs of websites behind Cloudflare via their API
 #
-# MNSmitasin@lbl.gov 2018-11-21
+# MNSmitasin@lbl.gov 2020-04-07
 #
 ###############################################################################
 ### LOCAL VARIABLES
