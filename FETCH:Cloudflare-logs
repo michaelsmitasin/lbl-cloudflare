@@ -9,14 +9,12 @@
 
 NOTIFYEMAIL="admin@example.com"
 
+RUNTS=$(date -j "+%s")
+
 # Paths
 FEEDDIR="/home/feeds/CLOUDFLARE-logs"
 LIBDIR="/home/feeds/lib"
-
-# Initial Values at runtime
-TIMESTAMPFILE="$LIBDIR/Cloudflare-logs-LastRunTimeStamp"
-CURRENTTIME=$(date -j "+%s")
-RUNCOUNT="0"
+TEMPPATH="/var/tmp/cloudflare-logs-$RUNTS"
 
 # Cloudflare variables
 CFAPIVERSION="v4"
@@ -24,6 +22,10 @@ CFAPIVERSION="v4"
 # Authentication
 USERNAME="feeds@example.com"
 AUTHKEY=$(cat $LIBDIR/CLOUDFLARE-api-key | grep -v "\#")
+
+# For zone fetch pagination, initialize the variable for first run
+ZONEDATA="INIT"
+THISPAGE="1"
 
 # Other variablse
 #FIELDLIST="ClientIP,RayID,EdgeStartTimestamp"
@@ -52,72 +54,183 @@ WAFProfile,\
 WAFRuleID,\
 WAFRuleMessage"
 
+# set initial values to null so we can set them with getopts 
+STARTTIME=""
+ENDTIME=""
+EXECOPT=""
+
 ###############################################################################
 ### FUNCTIONS
 
-# Check that TIMESTAMPFILE is non-null, error and exit if null
-if [ -z $(cat "$TIMESTAMPFILE") ]
+USAGE(){
+        echo "Usage:"
+        echo "$0 -[b|r] -s <starttime> -e <endtime>"
+        echo "  -b      build mode"
+        echo "  -r      run mode"
+        echo "  -s      start time (epoch)"
+        echo "  -e      end time (epoch)"
+        echo ""
+        exit 1
+}
+
+if [ -z "$1" ]
 then
-  echo "$0 will not continue until TIMESTAMPFILE returns non-null value" | /usr/bin/mail -s "FETCH:Cloudflare - TIMESTAMPFILE is null" "$NOTIFYEMAIL"
-  exit 1
+        echo "Error: no options specified"
+        USAGE
 else
-  : # no-op
+        :
 fi
 
-CHECKCURRENTTIME(){
-  TIMEDIFF=$(echo "$CURRENTTIME - $(cat $TIMESTAMPFILE)" | bc)
-  # Cloudflare will only returns logs older than 5 mins
-  # Check if the last timestamp is less than 10 mins old, so that we don't try to fetch a 5 min interval that would go less than 5 mins old
-  if [ "$TIMEDIFF" -lt 600 ]
-  then
-    exit 0
-  else
-#    echo "Time Difference: $TIMEDIFF"
-    : # no-op
-  fi
+while getopts "brz:s:e:h?" OPT; do
+case $OPT in
+        b) EXECOPT="BUILD" ;;
+        r) EXECOPT="RUN" ;;
+        z) ZONEID="$OPTARG" ;;
+        s) STARTTIME="$OPTARG" ;;
+        e) ENDTIME="$OPTARG" ;;
+        h) USAGE ;;
+        ?) USAGE ;;
+        \?) USAGE ;;
+esac
+done
+
+if [ -z "$EXECOPT" ]
+then
+        echo "Error: must specify -b or -r"
+        USAGE
+else
+        :
+fi
+
+### Build stage
+
+SETBUILDTIME(){
+# if starttime/endtime not specified, set it to 1h10m ago to 10m ago
+if [ -z "$STARTTIME" ]
+then
+        STARTTIME="$(date -j -v-1H -v-10M +%s)"
+        ENDTIME="$(date -j -v-10M +%s)"
+else
+        :
+fi
 }
 
 # List Zones
-ZONEIDS=$(/usr/local/bin/curl -s -X GET "https://api.cloudflare.com/client/$CFAPIVERSION/zones?status=active" \
-     -H "X-Auth-Email: $USERNAME" \
-     -H "X-Auth-Key: $AUTHKEY" \
-     -H "Accept: application/json" | /usr/local/bin/jq -r .result[].id)
+# Continue looping over pages of zone IDs until no more are returned
+GETZONES(){
+        while [ ! -z "$ZONEDATA" ]
+        do
+                ZONEDATA=$(/usr/local/bin/curl -s -X GET "https://api.cloudflare.com/client/v4/zones?status=active&per_page=20&page=$THISPAGE" \
+                        -H "X-Auth-Email: $USERNAME" \
+                        -H "X-Auth-Key: $AUTHKEY" \
+                        -H "Accept: application/json" | /usr/local/bin/jq -r '.result[]| .id')
+                sleep 1 
+                echo "$ZONEDATA"
+                # Increment the page number
+                THISPAGE=$(echo "$THISPAGE" + 1 | bc)
+        done
+}
 
-FETCH(){
-  CHECKCURRENTTIME
-  # Output filename, should be logs in Pacific Time up to day change
-  THISMONTH="$(date -j -r "$LASTTIMESTAMP" "+%Y-%m")"
-  OUTFILE="$(date -j -r "$LASTTIMESTAMP" "+%Y-%m-%d")"
+BUILDCMDS(){
+  echo "$ZONEIDS" | xargs -n1 -I@ echo "$0 -r -z @ -s $INTVSTARTTIME -e $INTVENDTIME >> $TEMPPATH/zone-@-$INTVSTARTTIME.json" > $TEMPPATH/parallel-cmds
+}
+
+RUNCMDS(){
+  /usr/local/bin/parallel -j10 -a $TEMPPATH/parallel-cmds
+} 
+
+CONSOLIDATE(){
+  THISMONTH=$(date -j -r $STARTTIME "+%Y-%m")
+  OUTFILE=$(date -j -r $STARTTIME "+%Y-%m-%d")
   OUTPATH="$FEEDDIR/$THISMONTH"
   mkdir -p "$OUTPATH"
-  # Loop through zones to fetch logs
-  for ZONEID in $ZONEIDS;
+  cat $TEMPPATH/zone*.json >> "$OUTPATH"/"$OUTFILE"
+}
+
+### Run stage
+
+CHECKTIMES(){
+if [ -z "$STARTTIME" ]
+then
+        echo "Error: no start time specified"
+        USAGE
+else
+        :
+fi
+
+if [ -z "$ENDTIME" ]
+then
+        echo "Error: no end time specified"
+        USAGE
+else
+        :
+fi
+}
+
+FETCH(){
+  echo "INFO: $STARTTIME $ZONEID" >> $FEEDDIR/cloudflare-fetch.log
+  RESULTS=$(/usr/local/bin/curl -s -X GET "https://api.cloudflare.com/client/$CFAPIVERSION/zones/$ZONEID/logs/received?start=$STARTTIME&end=$ENDTIME&fields=$FIELDLIST&timestamps=unixnano" \
+    -H "X-Auth-Email: $USERNAME" \
+    -H "X-Auth-Key: $AUTHKEY" \
+    -H "Accept: application/json")
+}
+
+# If any line in the results doesn't match the known-good criteria, retry
+CHECKRESULTS(){
+  if [ -z "$(echo "$RESULTS" | grep -v '^{"CacheCacheStatus".*"}')" ]
+    then
+      echo "$RESULTS" | grep -v '^$'
+      RUNCOUNT="5"
+    else
+      echo "ERROR: run $RUNCOUNT: $STARTTIME $ZONEID: $RESULTS" | tr -d "\n" | cut -c -256 >> $FEEDDIR/cloudflare-fetch.log 
+      echo "" >> $FEEDDIR/cloudflare-fetch.log 
+      RUNCOUNT=$(echo "$RUNCOUNT" + 1 | bc)
+      sleep 5
+  fi
+}
+
+PULL(){
+  RUNCOUNT="0"
+  while [ "$RUNCOUNT" -le 4 ]
   do
-    # sleep to avoid "429 Too Many Requests"
-    sleep 5
-    /usr/local/bin/curl -s -X GET "https://api.cloudflare.com/client/$CFAPIVERSION/zones/$ZONEID/logs/received?start=$STARTTIME&end=$ENDTIME&fields=$FIELDLIST&timestamps=unixnano" \
-       -H "X-Auth-Email: $USERNAME" \
-       -H "X-Auth-Key: $AUTHKEY" \
-       -H "Accept: application/json" >> "$OUTPATH"/"$OUTFILE"
+    FETCH
+    CHECKRESULTS
   done
 }
 
-# Loop through a sane number of times that won't overlap cron intervals, incrementing the LastRunTimeStamp file by 5 mins
-# each time. This allows us to "catch up", such as if the machine this runs on is down or Cloudflare's API is unreachable
-while [ "$RUNCOUNT" -lt 2 ] ;
-do
-  RUNCOUNT=$(echo "$RUNCOUNT" + 1 | bc)
-  # Set all the working timestamps based on last time stamp
-  LASTTIMESTAMP=$(cat "$TIMESTAMPFILE")
-  STARTTIME=$(date -j -r "$LASTTIMESTAMP" -u "+%Y-%m-%dT%H:%M:%SZ")
-  ENDINUNIX=$(date -j -r $(echo "$LASTTIMESTAMP" +300 | bc) "+%s")
-  ENDTIME=$(date -j -r $ENDINUNIX -u "+%Y-%m-%dT%H:%M:%SZ")
-  FETCH
-  # Write the last time stamp out to the tracker file to be used as start time stamp next loop
-  echo "$ENDINUNIX" > "$TIMESTAMPFILE"
-  sleep 1
-done
+###############################################################################
+### EXECUTION
+
+# Execute different functions depending on mode
+if [ "$EXECOPT" == "BUILD" ]
+then
+        SETBUILDTIME
+        ZONEIDS=$(GETZONES)
+        mkdir -p $TEMPPATH
+        while [ "$STARTTIME" -lt "$ENDTIME" ]
+        do
+                INTVSTARTTIME=$(date -j -r "$STARTTIME" -u "+%Y-%m-%dT%H:%M:%SZ")
+                STARTTIME=$(echo "$STARTTIME + 3600" | bc)
+                INTVENDTIME=$(date -j -r "$STARTTIME" -u "+%Y-%m-%dT%H:%M:%SZ")
+                BUILDCMDS
+                RUNCMDS
+                # add a delay so that we don't hit the rate limit
+                sleep 30
+        done
+        # when this run is done, consolidate the json to the final file
+        CONSOLIDATE
+        # remove the temp files
+        logger "$0 - removing $TEMPPATH"
+        rm -r "$TEMPPATH"
+elif [ "$EXECOPT" == "RUN" ]
+then
+        CHECKTIMES
+        PULL
+else 
+        echo "Error: unknown mode"
+        USAGE
+fi
 
 ###############################################################################
 ### CLEANUP
-exit
+exit 0
